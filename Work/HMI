@@ -1,0 +1,1187 @@
+#include <macro.h>
+#include <math.h>
+#define Basic 2
+#define DataPCH1 11
+#define BasicParamPCH1 12
+#define DriveParamPCH1 13
+#define ProtectElectrPCH1 14
+#define StatusPCH1 15
+#define DataPCH2 21
+#define BasicParamPCH2 22
+#define DriveParamPCH2 23
+#define ProtectElectrPCH2 24
+#define StatusPCH2 25
+#define DataPCH3 31
+#define BasicParamPCH3 32
+#define DriveParamPCH3 33
+#define ProtectElectrPCH3 34
+#define StatusPCH3 35
+
+MacroOper macroOper;
+void setMacroOper(MacroOper _macroOper) { macroOper = _macroOper; }
+#define setMacroOper() setMacroOper(macroOper)
+
+
+// Чтение выбранного бита  
+bool readBit(unsigned short value, int position) {
+	return ((value & (1 << position)) != 0);
+}
+//======================================================================
+// Запись значения в выбранный бит
+unsigned short writeBit(unsigned short value, int position) {
+	return (value | (1 << position));
+}
+//======================================================================
+// Сброс значения выбранного бита
+unsigned short resetBit(unsigned short value, int position) {
+	return (value & ~(1 << position));
+}
+//======================================================================
+/* Масштабирование x_min…x_max -> y_min…y_max
+val - входной сигнал
+in_min - минимальное значение входного сигнала
+in_max - максимальное значение входного сигнала
+out_min - минимальное значение выходного сигнала
+out_max - максимальное значение выходного сигнала*/
+float scaling(float val, float in_min, float in_max, float out_min, float out_max) {
+	if(in_max!=in_min && val>in_min) // Проверяем, что не делим на 0
+		return (out_max-out_min)*((val-in_min)/(in_max-in_min))+out_min;
+	else
+		return 0.0;
+}
+// Читаем множество регистров из ПЧ и сохраняем в регистры панели LW : P00.00 -> LW1000
+#define read_memory_PCH(numPCH,group,param,num) ({                                      \
+	unsigned short data[num];                                                    \
+	if (GetWord(@numPCH@,0) != numPCH) SetWord(@numPCH@, 0, numPCH);													\
+	int offsetAddres = group * 256 + param;                                      \
+	if (GetMem(data, @P00_PCH@, offsetAddres, num*sizeof(short)))                    \
+		SetMem(data, @P00_in_HMI@, group*100+param+(numPCH-1)*10000, num*sizeof(short));          \
+})	
+// Читаем один регистр из ПЧ (для работы в POU)
+#define read_PCH(numPCH, group,param) read_PCH_Param(numPCH, group,param)
+unsigned short	read_PCH_Param(unsigned short numPCH, int group, int param) {
+	if (GetWord(@numPCH@,0) != numPCH) SetWord(@numPCH@, 0, numPCH);												
+	int offsetAddres = group * 256 + param;
+	unsigned short Val=0;
+	return Val=GetWord(@P00_PCH@, offsetAddres);
+
+}
+// Читаем параметры в POU из регистров панели LW
+#define read_HMI_P(numPCH,group,param) HMI_P_Param(numPCH,group,param)
+unsigned short HMI_P_Param(unsigned short numPCH, int group, int param) {
+	unsigned short val=0;                                           
+	return val = GetWord(@P00_in_HMI@, group*100+param+(numPCH-1)*10000);            
+}
+//	Записываем параметры в ПЧ из регистров панели
+#define write_PCH(numPCH, group,param,value) ({                                     \
+	int offsetAddres = group * 256 + param;                               		    \
+	if (GetWord(@numPCH@,0) != numPCH) SetWord(@numPCH@, 0, numPCH);				\
+	SetWord(@P00_PCH@, offsetAddres, value);                                   		\
+	SetWord(@P00_in_HMI@, group*100+param+(numPCH-1)*10000, value);                 \
+})
+// Проверка изменения параметра пользователем
+#define Change(numPCH,group,param)({                                                \
+if (GetBit(@LB0@,1000+group*100+param)) {                               		    \
+			SetBit(@LB0@,1000+group*100+param+(numPCH-1)*10000,0);                  \
+			write_PCH(numPCH,group,param,read_HMI_P(numPCH,group,param));           \
+		}                                                                  			\
+})
+// Уставки давления для день/ночь (если изменили уставку в главном окне, то уставка записывается в уставку текущего режима день/ночь)
+#define SetPressDay()													   \
+if (GetBit(@change_CurrentSetPress@,0)) {							   	   \
+	SetBit(@change_CurrentSetPress@,0,0);								   \
+	SetPressDay=GetWord(@CurrentSetPress@,0);							   \
+}																		   \
+CurrentSetPress=SetPressDay;											   \
+SetBit(@indDayNight@,0,0);
+
+#define SetPressNight()												   	   \
+if (GetBit(@change_CurrentSetPress@,0)) {								   \
+	SetBit(@change_CurrentSetPress@,0,0);								   \
+	SetPressNight=GetWord(@CurrentSetPress@,0);							   \
+}																		   \
+CurrentSetPress=SetPressNight;											   \
+SetBit(@indDayNight@,0,1);
+// Проверка на переключение на ручное управление системы
+#define CheckManualControl()											   \
+if (!S2) {																   \
+	StateOfSystem = 80;													   \
+	break;																   \
+}
+
+// Задаем роли насосов по их наработке
+unsigned short setRolePCH(int MinWorkPCH[0]) {
+	unsigned short nMain, nAddit, nReserv;
+	if ((MinWorkPCH[0] <= MinWorkPCH[1]) && (MinWorkPCH[0] <= MinWorkPCH[2])) nMain = 1;
+	else if ((MinWorkPCH[1] <= MinWorkPCH[2]) && (MinWorkPCH[1] <= MinWorkPCH[0])) nMain = 2;
+	else if ((MinWorkPCH[2] <= MinWorkPCH[1]) && (MinWorkPCH[2] <= MinWorkPCH[0])) nMain = 3;
+	switch (nMain) {
+	case 1: // основной насос - ПЧ1
+		nReserv = MinWorkPCH[1] > MinWorkPCH[2] ? 2:3;
+		break;
+	case 2: // основной насос - ПЧ2
+		nReserv = MinWorkPCH[0] > MinWorkPCH[2] ? 1:3;
+		break;
+	case 3: // основной насос - ПЧ3
+		nReserv = MinWorkPCH[0] > MinWorkPCH[1] ? 1:2;
+		break;
+	}
+	nAddit = 6 - nMain - nReserv;
+	SetWord(@nMainPCH@,0,nMain);
+	SetWord(@nAdditPCH@,0,nAddit);
+	SetWord(@nReservPCH@,0,nReserv);
+}
+//	Получение ролей ПЧ
+#define getRolePCH() ({											\
+	nMain = GetWord(@nMainPCH@,0);								\
+	nAddit = GetWord(@nAdditPCH@,0);							\
+	nReserv = GetWord(@nReservPCH@,0);							\
+})
+//	Пуск ПЧ по его номеру
+#define Start_PCH(numPCH) ({                                     \
+	switch (numPCH) {											 \
+	case 1:														 \
+		SetWord(@com_Start_Stop_PCH_1@, 0, 1);					 \
+		break;													 \
+	case 2:														 \
+		SetWord(@com_Start_Stop_PCH_2@, 0, 1);					 \
+		break;													 \
+	case 3:														 \
+		SetWord(@com_Start_Stop_PCH_3@, 0, 1);					 \
+		break;													 \
+	}															 \
+})
+//	Стоп ПЧ по его номеру
+#define Stop_PCH(numPCH) ({                                      \
+	switch (numPCH) {											 \
+	case 1:														 \
+		SetWord(@com_Start_Stop_PCH_1@, 0, 5);					 \
+		break;													 \
+	case 2:														 \
+		SetWord(@com_Start_Stop_PCH_2@, 0, 5);					 \
+		break;													 \
+	case 3:														 \
+		SetWord(@com_Start_Stop_PCH_3@, 0, 5);					 \
+		break;													 \
+	}															 \
+})
+//	Сброс ошибки ПЧ по его номеру
+#define Reset_PCH(numPCH) ({                                     \
+	switch (numPCH) {											 \
+	case 1:														 \
+		SetWord(@com_Start_Stop_PCH_1@, 0, 7);					 \
+		break;													 \
+	case 2:														 \
+		SetWord(@com_Start_Stop_PCH_2@, 0, 7);					 \
+		break;													 \
+	case 3:														 \
+		SetWord(@com_Start_Stop_PCH_3@, 0, 7);					 \
+		break;													 \
+	}															 \
+})
+//	запись уставки частоты в ПЧ по его номеру
+#define SetpointFreq(numPCH,setpoint) ({                                    	\
+	switch (numPCH) {															\
+	case 1:																		\
+		SetWord(@SetpointFreq_PCH_1@, 0, setpoint);								\
+		break;													 				\
+	case 2:														 				\
+		SetWord(@SetpointFreq_PCH_2@, 0, setpoint);								\
+		break;													 				\
+	case 3:														 				\
+		SetWord(@SetpointFreq_PCH_3@, 0, setpoint);								\
+		break;													 				\
+	}															 				\
+})
+//	Стоп всех ПЧ 
+#define Stop_all_PCH() ({                                      	 \
+		SetWord(@com_Start_Stop_PCH_1@, 0, 5);					 \
+		SetWord(@com_Start_Stop_PCH_2@, 0, 5);					 \
+		SetWord(@com_Start_Stop_PCH_3@, 0, 5);					 \
+})
+// Ротация насосов
+void Rotate(unsigned short nMain, unsigned short nAddit, unsigned short nReserv, bool MainError, bool AdditError) {                                           					
+	if ((!MainError) && (!AdditError)) {  																					
+		nMain = nAddit;            																										
+		nAddit = nReserv;                                                                                                  
+		nReserv = 6 - nMain - nAddit;																									
+	} else if (MainError) {
+		nReserv = nMain;
+		nMain = nAddit;
+		nAddit = 6 - nMain - nReserv;
+	} else if (AdditError) {
+		nReserv = nAddit;
+		nAddit = 6 - nMain - nReserv;
+	}
+	SetWord(@nMainPCH@,0,nMain);
+	SetWord(@nAdditPCH@,0,nAddit);
+	SetWord(@nReservPCH@,0,nReserv);
+}
+//  Получение состояния ПЧ по его номеру
+unsigned short Status_PCH(numPCH) {                                    				
+	switch (numPCH) {															
+	case 1:																		
+		return GetWord(@Status_PCH_1@, 0);										
+	case 2:														 				
+		return GetWord(@Status_PCH_2@, 0);										
+	case 3:														 				
+		return GetWord(@Status_PCH_3@, 0);										
+	}								 				
+}
+//  Получение частоты ПЧ по его номеру
+unsigned short GetFreq_PCH(numPCH) {                                    				
+	switch (numPCH) {															
+	case 1:																		
+		return GetWord(@CurrentFreq_PCH_1@, 0);										
+	case 2:														 				
+		return GetWord(@CurrentFreq_PCH_2@, 0);										
+	case 3:														 				
+		return GetWord(@CurrentFreq_PCH_3@, 0);										
+	}		
+}
+//  Формирование ошибки связи ПЧ по его номеру
+unsigned short CommError_PCH(numPCH) {                                    				
+	switch (numPCH) {															
+	case 1:																		
+		return readBit(GetWord(@SRW0@,120), 1);										
+	case 2:														 				
+		return readBit(GetWord(@SRW0@,120), 2);										
+	case 3:														 				
+		return readBit(GetWord(@SRW0@,120), 3);										
+	}		
+}
+
+//	запись времени разгона и торможения в ПЧ по его номеру	
+#define SetTimeAccDec(numPCH,timeACC, timeDEC) ({                                    		\
+	switch (numPCH) {																		\
+	case 1:																					\
+		SetWord(@time_ACC_PCH1@, 0, timeACC);												\
+		SetWord(@time_DEC_PCH1@, 0, timeDEC);												\
+		break;													 							\
+	case 2:														 							\
+		SetWord(@time_ACC_PCH2@, 0, timeACC);												\
+		SetWord(@time_DEC_PCH2@, 0, timeDEC);												\
+		break;													 							\
+	case 3:														 							\
+		SetWord(@time_ACC_PCH3@, 0, timeACC);												\
+		SetWord(@time_DEC_PCH3@, 0, timeDEC);												\
+		break;													 							\
+	}															 							\
+})
+//	Проверка обрыва датчика
+#define CheckBreakSensor() ({                                      	 \
+		if (CurrentPressure <= LevelSensorBreak){
+			TON_SensBreakIn=GetBit(@TON_SensBreakIn@,0);			 // считываем вход таймера 
+				TON_SensBreakQ=GetBit(@TON_SensBreakQ@,0);				 // считываем выход таймера 					 
+				if (!TON_SensBreakIn && !TON_SensBreakQ) {				 // если таймер еще не запущен
+					SetWord(@TON_SensBreakPT@,0,Time);			 // передаем в таймер время для отсчета, заданное с панели
+					SetBit(@TON_SensBreakIn@,0,1);					 // и запускаем таймер
+				}					
+				if (TON_SensBreakIn && TON_SensBreakQ) {				 // если таймер запущен и сработал
+					StateOfSystem = 40;								 // то смени состояни системы на "Работа основного + пуск дополнительного насоса"
+					SetBit(@TON_SensBreakIn@,0,0);					 // и останови таймер
+					break;						
+				} 
+		} else if (GetBit(@TON_SensBreakIn@,0)) SetBit(@TON_SensBreakIn@,0,0);	 // иначе если таймер активирован - деактивировать таймер			\
+						 \
+						 \
+})
+
+//======================================================================
+// Входы/выходы ПЧ
+#define S1 readBit(read_HMI_P(nMain,17,12), 0)
+#define S2 readBit(read_HMI_P(nMain,17,12), 1)
+#define S3 readBit(read_HMI_P(nMain,17,12), 2)
+#define S4 readBit(read_HMI_P(nMain,17,12), 3)
+#define HDI readBit(read_HMI_P(nMain,17,12), 4)
+#define LED_PCH_On() SetBit(@LED_PCH_On_Off@,0,1)
+#define LED_PCH_Off() SetBit(@LED_PCH_On_Off@,0,0)
+#define RotateOn() if (!GetBit(@TrigRotateOn@,0)) SetBit(@TrigRotateOn@,0,1)
+#define RotateOff() if (GetBit(@TrigRotateOn@,0)) { SetBit(@TrigRotateOn@,0,0); SetWord(@CurTimeWork@,0,0); }
+#define CheckSystemeError() if (((MainError) && (AdditError)) || ((MainError) && (ReservError)) || ((AdditError) && (ReservError))) {StateOfSystem = 90; break;}
+#define openWaitWin() SetBit(@WaitWin@, 0, 1); // выводим окно "ПЧ не на связи.."
+#define closeWaitWin() SetBit(@WaitWin@, 0, 0); // закрываем окно "ПЧ не на связи.."
+
+int MacroMain()  // Основная программа
+{
+	setMacroOper();
+// Переменные
+	unsigned short 
+	CurrentWindow,                    // текущее открытое окно HMI
+	CurrentProgWindow,				  // текущее окно в программе (для чтения параметров)
+	CurrentPressure,                  // текущее значение давления
+	SensScaleMin,                     // минимальное значение шкалы датчика давления
+	SensScaleMax,                     // максимальное значение шкалы датчика давления
+	CurrentSetPress,                  // текущая уставка давления, заданная на HMI    
+	PIDmin,                           // минимальное значение ПИД, бар
+	PIDmax,                           // максимальное значение ПИД, бар
+	setPID,                           // уставка ПИД
+	StatusMain,						  // статус основного ПЧ
+	StatusAddit,					  // статус дополнительного ПЧ
+	StatusReserv,					  // статус резервного ПЧ
+	SetPressDay,					  // уставка давления дня
+	SetPressNight, 					  // уставка давления ночи
+	CurrentTime, 					  // текущее время 
+	DayModeTimeWD, 					  // время начало дня (будни)
+	NightModeTimeWD, 				  // время начало ночи (будни)
+	DayModeTimeWE, 					  // время  начало дня (выходные)
+	NightModeTimeWE, 				  // время начало ночи (выходные)
+	Day,							  // текущий день недели
+	ServiceInterval,                  // сервисный интервал, ч
+	numPCH,							  // номер ПЧ (тест)
+	nMain,							  // номер основного ПЧ
+	nAddit,							  // номер дополнительного ПЧ
+	nReserv,						  // номер резервного ПЧ
+	StateOfSystem = 0,				  // состояние системы
+	LevelSensorBreak,				  // уровень обрыва датчика
+	SetPointPressStart,				  // уставка старта системы в автоматическом режиме
+	TimeAddPump = GetWord(@TimeAddPump@,0), // уставка по времени для добавления насоса
+	PressAddPump = GetWord(@PressAddPump@,0), // уставка по давлению для добавления насоса
+	FreqAddPump = GetWord(@FreqAddPump@,0), // уставка по частоте для добавления насоса
+	TimeDecrPump = GetWord(@TimeDecrPump@,0), // уставка по времени для отключения насоса
+	PressDecrPump = GetWord(@PressDecrPump@,0), // уставка по давлению для отключения насоса
+	FreqDecrPump = GetWord(@FreqDecrPump@,0), // уставка по частоте для отключения насоса
+	time_ACC_start = GetWord(@time_ACC_start@,0),						  // время разгона ПЧ при старте
+	time_DEC_start = GetWord(@time_DEC_start@,0),						  // время торможения ПЧ при старте
+	time_ACC = GetWord(@time_ACC@,0),															  // время разгона ПЧ 
+	time_DEC = GetWord(@time_DEC@,0),															  // время торможения ПЧ																
+	RotateTime = GetWord(@RotateTime@,0),						  // время ротации, ч
+	CurTimeWork,					  // текущее время работы, м
+	FreqRotation = GetWord(@FreqRotation@,0);					  // допустимая частота ротации, Гц
+	bool TON_PumpAddIn,				  // вход таймера подключения насоса
+	TON_PumpAddQ,				  	  // выход таймера подключения насоса
+	TON_PumpDecrIn,					  // вход таймера отключения насоса
+	TON_PumpDecrQ,				  	  // выход таймера отключения насоса
+	TON_PressRelayIn,				  // вход таймера реле давления
+	TON_PressRelayQ,				  // выход таймера реле давления
+	MainError,						  // ошибка основного насоса
+	AdditError,						  // ошибка дополнительного насоса
+	ReservError;                      // ошибка резервного насоса
+	float PID_max,                    // максимум шкалы ПИД 
+	PID_min;                          // минимум шкалы ПИД
+	int i,
+	StartMcTime,                      // время начала выполнения макроса
+	EndMcTime,                        // время окончания выполнения макроса
+	SecRunM[3],   					  // время работы насосов в секундах
+	HourRunM[3],   					  // время работы насосов вчасах
+	StartService[3],				  // начало сервисных интервалов, с
+	HourService[3],  				  // остаток времени до сервиса насоса, ч
+	NumStartM[3],  					  // количество пусков насосов
+	McTime;                           // время выполнения макроса
+// SimpleStart
+	SetBit(@SimpleStart@,0,1);        // запускаем функцию быстрый старт
+	SetWord(@StepSimpleStart@,0,0);        // первый шаг быстрого старта
+	openWaitWin();
+	do {                             // проверить чтобы цикл не запускался пока ПЧ не на связи
+		StatusMain = GetWord(@Status_PCH_1@, 0);
+		StatusAddit = GetWord(@Status_PCH_2@, 0);
+		StatusReserv = GetWord(@Status_PCH_3@, 0);		
+	} while ((GetWord(@SRW0@,120)!=0));
+	closeWaitWin();
+	// Установка параметров по умолчанию при первом включении 
+	if (GetWord(@HourDayWD@,0)==0 && GetWord(@MinuteDayWD@,0)==0 && GetWord(@HourNightWD@,0)==0 && GetWord(@MinuteNightWD@,0)==0) {
+		SetWord(@HourDayWD@,0,6); // время начала дня по умолчанию
+		SetWord(@HourNightWD@,0,22); // время начала ночи по умолчанию
+	}
+	if (GetWord(@HourDayWE@,0)==0 && GetWord(@MinuteDayWE@,0)==0 && GetWord(@HourNightWE@,0)==0 && GetWord(@MinuteNightWE@,0)==0) {
+		SetWord(@HourDayWE@,0,9); // время начала дня по умолчанию
+		SetWord(@HourNightWE@,0,1); // время начала ночи по умолчанию
+	}
+	if(GetBit(@SRB0@,10010)==0) SetBit(@SRB0@,10010,1); // выключить звук нажатий
+// Начальная инициализация. Читаем параметры каждого ПЧ и записываем нужные для работы параметры в ПЧ
+	for (i=1; i<4; i++) {
+		read_memory_PCH(i,0,0,2);    // читаем P00.00-P00.01
+		read_memory_PCH(i,0,3,6);    // читаем P00.03-P00.08
+		read_memory_PCH(i,0,11,3);   // читаем P00.11-P00.13
+		read_memory_PCH(i,2,1,5);    // читаем P02.01-P02.05
+		read_memory_PCH(i,5,0,6);    // читаем P05.00-P05.05
+		read_memory_PCH(i,5,24,4);   // читаем P05.24-P05.27  //temp
+		read_memory_PCH(i,5,50,1);   // читаем P05.50	      //temp
+		read_memory_PCH(i,6,1,4);    // читаем P06.01-P06.03
+		read_memory_PCH(i,7,27,6);   // читаем P07.27-P07.32
+		read_memory_PCH(i,9,0,13);   // читаем P07.27-P07.32
+		read_memory_PCH(i,11,1,1);   // читаем P11.01
+		read_memory_PCH(i,11,5,8);   // читаем P11.05-P11.12
+		read_memory_PCH(i,11,33,1);  // читаем P11.33
+		read_memory_PCH(i,11,47,1);  // читаем P11.47			//temp
+		read_memory_PCH(i,14,0,6);   // читаем P14.00-P14.05	//temp
+		read_memory_PCH(i,17,12,2);  // читаем P17.12-P17.13
+		read_memory_PCH(i,17,26,1);  // читаем P17.26
+		read_memory_PCH(i,90,1,11);  // читаем P17.26
+		if (read_HMI_P(i,0,1) != 1) write_PCH(i,0,1,1);  							 // источник команды пуск - Modbus
+		if (read_HMI_P(i,0,6) != 0) write_PCH(i,0,6,0);  							 // канал задания частоты A - панель (для ручного управления)
+		if (read_HMI_P(i,0,7) != 8) write_PCH(i,0,7,8);								 // канал задания частоты B (дистанция) - Modbus
+		if (read_HMI_P(i,1,8) != 1) write_PCH(i,1,8,1); 							 // режим останова - выбег
+		if (read_HMI_P(i,5,0) != 1) write_PCH(i,5,0,1);               		    	 // определяем HDI как цифровой вход
+		if (read_HMI_P(i,5,1) != 1) write_PCH(i,5,1,1);               		    	 // S1 - Пуск
+//		if (read_HMI_P(i,5,2) != 38) write_PCH(i,5,2,38);               		     // S2 - Автоматический режим (при отсутствии - ручной), функция ПЧ: 38 - управление по Modbus
+		if (read_HMI_P(i,5,3) != 13) write_PCH(i,5,3,13);               		     // S3 - перемычка с S2 (переход на канал задания частоты B)  функция ПЧ: 38 
+		if (read_HMI_P(i,5,4) != 9) write_PCH(i,5,4,9);               		    	 // S4 - Сухой ход, функция ПЧ: 9 - внешняя неисправность
+		if (read_HMI_P(i,5,5) != 0) write_PCH(i,5,5,0);               		    	 // HDI - Пожар, функция ПЧ: 0
+		if (read_HMI_P(i,5,24) != 200) write_PCH(i,5,24,200); 
+		if (read_HMI_P(i,5,25) != 0) write_PCH(i,5,25,0);               		     // начало шкалы аналогового входа AI1 - 0% 				temp
+		if (read_HMI_P(i,5,26) != 1000) write_PCH(i,5,26,1000);    					 // конец первичной шкалы - 10.00 В							temp
+		if (read_HMI_P(i,5,27) != 1000) write_PCH(i,5,27,1000);        			     // конец шкалы аналогового входа AI1 - 100.0%				temp
+		if (read_HMI_P(i,5,50) != 1) write_PCH(i,5,50,1); 							 // AI1 - токовый 											temp
+		if (read_HMI_P(i,6,3) != 5) write_PCH(i,6,3,5);               		    	 // R01 - авария ПЧ
+		if (read_HMI_P(i,6,4) != 1) write_PCH(i,6,4,1);               		    	 // R02 - работа ПЧ
+	}
+	
+// вычитываем роли ПЧ и конфигурируем их параметры, зависящие от роли=================================
+	setRolePCH(SecRunM); //задаем роли ПЧ по наработке
+	getRolePCH();
+//===================================================================
+
+ // устанавливаем биты запуска пересчета расчетных данных
+/*	SetBit(@change_PressFall_minLevel@,0,1);     			 				
+	SetBit(@change_PressFall_maxLevel@,0,1);
+	SetBit(@change_PressFall_Time@,0,1);
+	SetBit(@change_PressUpSleep@,0,1);
+	SetBit(@change_PressAwake@,0,1);
+	SetBit(@change_PressConnect@,0,1);
+	SetBit(@change_PressDisconnect@,0,1);
+*/                             							
+	while (1) {	// Основной цикл макроса
+		StartMcTime = GetWord(@Seconds@, 0)*1000+GetWord(@mSeconds@, 0);
+		SensScaleMin = GetWord(@SensScaleMin@,0);      				 // вычитываем с HMI установленное значение минимума шкалы датчика, бар    
+		SensScaleMax = GetWord(@SensScaleMax@,0);      				 // вычитываем с HMI установленное значение максимума шкалы датчика, бар
+		CurrentWindow = GetWord(@CurrentWindow@,0);    				 // получаем номер текущего окна HMI
+		SetPointPressStart = GetWord(@SetPointPressStart@,0);    	 // получаем уставку старта системы в автоматическом режиме
+		CurrentSetPress = GetWord(@CurrentSetPress@,0);				 // temp
+//		if (GetWord(@numbersAlarmPCH@,0) || GetWord(@numbersAlarmPump@,0)) SetBit(@Alarm@,0,1); // устанавливаем бит аварии, если есть хотя бы одна авария ПЧ или НС
+//		else SetBit(@Alarm@,0,0);                                                               // иначе сбрасываем
+// Читаем состояние ПЧ 
+		StatusMain = Status_PCH(nMain);
+		StatusAddit = Status_PCH(nAddit);
+		StatusReserv = Status_PCH(nReserv);
+		MainError = (CommError_PCH(nMain) || (StatusMain == 4));
+		AdditError = (CommError_PCH(nAddit) || (StatusAddit == 4));
+		ReservError = (CommError_PCH(nReserv) || (StatusReserv == 4));
+		RotateTime = GetWord(@RotateTime@,0);     // temp
+		FreqRotation = GetWord(@FreqRotation@,0);     // temp
+//		LED_PCH_On();      // устанавливаем состояние светодиода в зависимости от состояния ПЧ
+//		else LED_PCH_Off();
+//		if (StatusPCH_1 == 4) SetWord(@FaultPCH@,0,GetWord(@FaultPCHCode@,0));                // формируем сообщение об аварии
+// Вычисляем давление в бар и отбражаем на HMI 
+		CurrentPressure = (short)scaling(GetWord(@AI1_PCH1@,0), 200, 1000, SensScaleMin,SensScaleMax); 
+		SetWord(@CurrentPressure@,0,CurrentPressure);
+// Считываем дискретные входа и выхода основного насоса
+		read_memory_PCH(nMain,17,12,1);
+// Автомат работы системы
+		switch (StateOfSystem) {
+		
+		case 0:     // Система остановлена и готова (сразу после инициализации)
+			if (S2) {																	   // если система в автоматическом режиме управления
+				if (StatusMain == 1) Stop_PCH(nMain);
+				if (StatusAddit == 1) Stop_PCH(nAddit);
+				if (StatusReserv == 1) Stop_PCH(nReserv);
+				GetMemEx(SecRunM, @SecRunM1@, 0, 3*sizeof(int), DATA_INT32);				// читаем наработку в минутах
+				setRolePCH(SecRunM); 														// задаем роли ПЧ по наработке
+				getRolePCH();
+				StateOfSystem = 10;	 													   // смени состояние системы на "Контроль давления"
+				break;													 
+			} else {																	   // если ключ в положении "Ручное" - смени состояние системы на "Ручной режим"
+				StateOfSystem = 80;	
+				break;
+			}	
+			break;
+			
+		case 10:  // Контроль давления
+			CheckSystemeError();						   								// если любые 2 насоса в ошибке - смени состояние системы на "Авария"
+			if (MainError)	{												
+				Rotate(nMain, nAddit, nReserv, MainError, AdditError);		
+				getRolePCH();																	
+				break;														
+			}
+			if ((S2) && (SetPointPressStart > CurrentPressure) ) { 						// если давление меньше уставки старта - смени состояние системы на "Пуск основного насоса"
+				StateOfSystem = 20;	
+				break;
+			} else CheckManualControl();
+			break;
+			
+		case 20:  // Пуск основного насоса
+			if (StatusMain == 3) {
+				SetTimeAccDec(nMain,time_ACC_start,time_DEC_start);
+				SetpointFreq(nMain, 3000);
+				Start_PCH(nMain);
+				RotateOn();
+			}
+			CheckManualControl();
+			CheckSystemeError();						   								// если любые 2 насоса в ошибке - смени состояние системы на "Авария"
+			if (MainError)	{												
+				Rotate(nMain, nAddit, nReserv, MainError, AdditError);		
+				getRolePCH();					
+				break;														
+			}
+			if (GetFreq_PCH(nMain) >= 3000) {		// если ПЧ достиг 30 Гц смени состояние системы на "Работа основного насоса"
+				SetTimeAccDec(nMain,time_ACC,time_DEC);
+				if (GetBit(@EnPID@,0) != 1) SetBit(@EnPID@,0,1);							// активируем ПИД
+				StateOfSystem = 30;				
+				break;
+			}
+			break;
+		
+		case 30:  // Работа основного насоса
+			CheckSystemeError();						   								// если любые 2 насоса в ошибке - смени состояние системы на "Авария"
+			if (MainError)	{												
+				Stop_PCH(nMain);
+				Rotate(nMain, nAddit, nReserv, MainError, AdditError);		
+				getRolePCH();	
+				StateOfSystem = 20;					
+				break;														
+			} else if (AdditError) {
+				Rotate(nMain, nAddit, nReserv, MainError, AdditError);
+				getRolePCH();
+			}
+			CheckManualControl();
+			setPID =  GetWord(@setPID@,0);
+			SetpointFreq(nMain, setPID);
+			// Подключение дополнительного насоса
+			if ((StatusAddit == 3) && (FreqAddPump <= setPID) && (CurrentSetPress >= CurrentPressure + PressAddPump)) { // частота основного насоса больше или равна уставке и давление в системе меньше уставки то 
+				TON_PumpAddIn=GetBit(@TON_PumpAddIn@,0);			 // считываем вход таймера 
+				TON_PumpAddQ=GetBit(@TON_PumpAddQ@,0);				 // считываем выход таймера 					 
+				if (!TON_PumpAddIn && !TON_PumpAddQ) {				 // если таймер еще не запущен
+					SetWord(@TON_PumpAddPT@,0,TimeAddPump);			 // передаем в таймер время для отсчета, заданное с панели
+					SetBit(@TON_PumpAddIn@,0,1);					 // и запускаем таймер
+				}					
+				if (TON_PumpAddIn && TON_PumpAddQ) {				 // если таймер запущен и сработал
+					StateOfSystem = 40;								 // то смени состояни системы на "Работа основного + пуск дополнительного насоса"
+					SetBit(@TON_PumpAddIn@,0,0);					 // и останови таймер
+					break;						
+				} 
+			} else if (GetBit(@TON_PumpAddIn@,0)) SetBit(@TON_PumpAddIn@,0,0);	 // иначе если таймер активирован - деактивировать таймер
+			
+			// Отключение основного насоса		
+			if ((StatusMain == 1) && (FreqDecrPump >= setPID) && (CurrentPressure >= CurrentSetPress+ PressDecrPump)) { // если основной насос в работе, его частота меньше частоты отключения и давление больше уставки + отклонение, то 
+				TON_PumpDecrIn=GetBit(@TON_PumpDecrIn@,0);			 // считываем вход таймера 
+				TON_PumpDecrQ=GetBit(@TON_PumpDecrQ@,0);		     // считываем выход таймера 					 
+				if (!TON_PumpDecrIn && !TON_PumpDecrQ) {			 // если таймер еще не запущен
+					SetWord(@TON_PumpDecrPT@,0,TimeDecrPump);		 // передаем в таймер время для отсчета, заданное с панели
+					SetBit(@TON_PumpDecrIn@,0,1);					 // и запускаем таймер
+				}					
+				if (TON_PumpDecrIn && TON_PumpDecrQ) {				 // если таймер запущен и сработал
+					Stop_PCH(nMain);	
+					SetBit(@TON_PumpDecrIn@,0,0);					 // и останови таймер
+					StateOfSystem = 0;								 // то смени состояни системы на "Готовность"
+					break;						
+				} 
+			} else if (GetBit(@TON_PumpDecrIn@,0)) SetBit(@TON_PumpDecrIn@,0,0);	 // иначе если таймер активирован - деактивировать таймер
+			
+			// Ротация по времени
+			if ((GetWord(@CurTimeWork@,0)/60 >= RotateTime) && (setPID <= FreqRotation)) {
+				Stop_PCH(nMain);
+				Rotate(nMain, nAddit, nReserv, MainError, AdditError);		
+				getRolePCH();
+				SetWord(@CurTimeWork@,0,0);
+				StateOfSystem = 20;
+				break;
+			}
+			break;
+		
+		case 40:  // Работа основного насоса + пуск дополнительного
+			CheckManualControl();
+			SetpointFreq(nMain, GetWord(@setPID@,0));
+			if (StatusAddit == 3) {
+				SetTimeAccDec(nAddit,time_ACC_start,time_DEC_start);
+				SetpointFreq(nAddit, 5000);																
+//				Start_PCH(nAddit);
+//				break;
+			}
+			CheckSystemeError();						   								// если любые 2 насоса в ошибке - смени состояние системы на "Авария"
+			if (MainError)	{												
+				Stop_PCH(nMain);
+				Rotate(nMain, nAddit, nReserv, MainError, AdditError);		
+				getRolePCH();	
+				StateOfSystem = 20;					
+				break;														
+			} else if (AdditError) {
+				Rotate(nMain, nAddit, nReserv, MainError, AdditError);
+				getRolePCH();
+				break;
+			}
+			if ((GetFreq_PCH(nAddit) >= 5000) || (StatusAddit == 3)) {		// если ПЧ дополнительного насоса достиг 50 Гц - смени состояние системы на "Работа основного и дополнительного насоса" (StatusAddit == 3) - ВРЕМЕННО
+				SetTimeAccDec(nAddit,time_ACC,time_DEC);
+				StateOfSystem = 50;				
+				break;
+			}
+			break;
+		
+		case 50: // Работа основного и дополнительного насоса
+			CheckSystemeError();
+			if (MainError)	{												
+				Stop_PCH(nMain);
+				Rotate(nMain, nAddit, nReserv, MainError, AdditError);		
+				getRolePCH();	
+				StateOfSystem = 40;					
+				break;														
+			} else if (AdditError) {
+				Stop_PCH(nAddit);
+				Rotate(nMain, nAddit, nReserv, MainError, AdditError);
+				getRolePCH();
+				StateOfSystem = 40;	
+				break;
+			}
+			setPID =  GetWord(@setPID@,0);
+			CheckManualControl();
+			SetpointFreq(nMain, setPID);
+			SetpointFreq(nAddit, setPID);
+		// Подключение резервного насоса	
+			if ((StatusReserv == 3) && (FreqAddPump <= setPID) && (CurrentSetPress >= CurrentPressure + PressAddPump)) { // частота основного насоса больше или равна уставке и давление в системе меньше уставки то 
+				TON_PumpAddIn=GetBit(@TON_PumpAddIn@,0);			 // считываем вход таймера 
+				TON_PumpAddQ=GetBit(@TON_PumpAddQ@,0);				 // считываем выход таймера 					 
+				if (!TON_PumpAddIn && !TON_PumpAddQ) {				 // если таймер еще не запущен
+					SetWord(@TON_PumpAddPT@,0,TimeAddPump);			 // передаем в таймер время для отсчета, заданное с панели
+					SetBit(@TON_PumpAddIn@,0,1);					 // и запускаем таймер
+				}					
+				if (TON_PumpAddIn && TON_PumpAddQ) {				 // если таймер запущен и сработал
+					StateOfSystem = 60;								 // то смени состояни системы на "Работа основного и дополнительного насоса + пуск резервного"
+					SetBit(@TON_PumpAddIn@,0,0);					 // и останови таймер
+					break;						
+				} 
+			} else if (GetBit(@TON_PumpAddIn@,0)) SetBit(@TON_PumpAddIn@,0,0);	 // иначе если таймер активирован - деактивировать таймер
+		// Отключение дополнительного насоса		
+			if (/*(StatusAddit == 1) && */(FreqDecrPump >= setPID)/*)*/ && (CurrentPressure >= CurrentSetPress+ PressDecrPump)) { // если доп насос в работе, его частота меньше частоты отключения и давление больше уставки + отклонение, то 
+				TON_PumpDecrIn=GetBit(@TON_PumpDecrIn@,0);			 // считываем вход таймера 
+				TON_PumpDecrQ=GetBit(@TON_PumpDecrQ@,0);		     // считываем выход таймера 					 
+				if (!TON_PumpDecrIn && !TON_PumpDecrQ) {			 // если таймер еще не запущен
+					SetWord(@TON_PumpDecrPT@,0,TimeDecrPump);		 // передаем в таймер время для отсчета, заданное с панели
+					SetBit(@TON_PumpDecrIn@,0,1);					 // и запускаем таймер
+				}					
+				if (TON_PumpDecrIn && TON_PumpDecrQ) {				 // если таймер запущен и сработал
+				/*	Stop_PCH(nAddit);	*/
+					SetBit(@TON_PumpDecrIn@,0,0);					 // и останови таймер
+					StateOfSystem = 30;								 // то смени состояни системы на "Работа основного насоса"
+					break;						
+				} 
+			} else if (GetBit(@TON_PumpDecrIn@,0)) SetBit(@TON_PumpDecrIn@,0,0);	 // иначе если таймер активирован - деактивировать таймер
+		// Ротация по времени	
+			if ((GetWord(@CurTimeWork@,0)/60 >= RotateTime) && (setPID <= FreqRotation)) {
+				Stop_PCH(nMain);
+				Rotate(nMain, nAddit, nReserv, MainError, AdditError);		
+				getRolePCH();
+				SetWord(@CurTimeWork@,0,0);
+				StateOfSystem = 40;
+				break;
+			}
+			break;	
+			
+		case 60:   // Работа основного и дополнительного насоса + пуск резервного
+			CheckManualControl();
+			setPID =  GetWord(@setPID@,0);
+			SetpointFreq(nMain, setPID);
+			SetpointFreq(nAddit, setPID);
+			if (StatusReserv == 3) {
+				SetTimeAccDec(nReserv,time_ACC_start,time_DEC_start);
+				SetpointFreq(nReserv, 5000);																
+//				Start_PCH(nReserv);
+//				break;
+			}
+			CheckSystemeError();
+			if ((GetFreq_PCH(nReserv) >= 5000) || (StatusReserv == 3)) {		// если ПЧ резервного насоса достиг 50 Гц - смени состояние системы на "Работа трех насосов" || (StatusAddit == 3) - ВРЕМЕННО
+				SetTimeAccDec(nReserv,time_ACC,time_DEC);
+				StateOfSystem = 70;				
+				break;
+			}
+			break;
+	
+		case 70: // Работа трех насосов
+		// Отключение одного насоса при его ошибке и смена состояния системы
+			CheckSystemeError() else if (MainError) {
+				Stop_PCH(nMain);
+				Rotate(nMain, nAddit, nReserv, MainError, AdditError);		
+				getRolePCH();	
+				StateOfSystem = 50;					
+				break;
+			} else if (AdditError) {
+				Stop_PCH(nAddit);
+				Rotate(nMain, nAddit, nReserv, MainError, AdditError);		
+				getRolePCH();	
+				StateOfSystem = 50;					
+				break;
+			} else if (ReservError) {
+				Stop_PCH(nReserv);
+				StateOfSystem = 50;					
+				break;
+			}
+			CheckManualControl();
+			// Запись частоты в ПЧ
+			setPID =  GetWord(@setPID@,0);
+			SetpointFreq(nMain,setPID);
+			SetpointFreq(nAddit,setPID);
+			SetpointFreq(nReserv,setPID);
+			// Отключение резервного насоса		
+			if (/*(StatusReserv == 1) && */(FreqDecrPump >= setPID)/*)*/ && (CurrentPressure >= CurrentSetPress+ PressDecrPump)) { // если резервный насос в работе, его частота меньше частоты отключения и давление больше уставки + отклонение, то 
+				TON_PumpDecrIn=GetBit(@TON_PumpDecrIn@,0);			 // считываем вход таймера 
+				TON_PumpDecrQ=GetBit(@TON_PumpDecrQ@,0);			 // считываем выход таймера 					 
+				if (!TON_PumpDecrIn && !TON_PumpDecrQ) {			 // если таймер еще не запущен
+					SetWord(@TON_PumpDecrPT@,0,TimeDecrPump);		 // передаем в таймер время для отсчета, заданное с панели
+					SetBit(@TON_PumpDecrIn@,0,1);					 // и запускаем таймер
+					break;
+				}					
+				if (TON_PumpDecrIn && TON_PumpDecrQ) {				 // если таймер запущен и сработал
+				/*	Stop_PCH(nReserv);	*/
+					SetBit(@TON_PumpDecrIn@,0,0);					 // и останови таймер
+					StateOfSystem = 50;								 // то смени состояни системы на "Работа основного и дополнительного насоса"
+					break;						
+				} 
+			} else if (GetBit(@TON_PumpDecrIn@,0)) SetBit(@TON_PumpDecrIn@,0,0);	 // иначе если таймер активирован - деактивировать таймер
+			break;	
+		
+		case 80:  // Ручной режим
+			RotateOff();
+			if (GetBit(@EnPID@,0) != 0) {
+				SetBit(@EnPID@,0,0);									// деактивируем ПИД
+				SetFloat(@Integral@,0,0);
+				SetFloat(@prevErr@,0,0);
+				SetWord(@setPID@,0,0);
+			}
+			if (S2) {
+				StateOfSystem = 0;								// Если ключ в Дистанции - смени состояние системы на "Готовность системы"
+				if (StatusMain == 1) Stop_PCH(nMain);
+				if (StatusAddit == 1) Stop_PCH(nAddit);
+				if (StatusReserv == 1) Stop_PCH(nReserv);
+				break;
+			}
+			break;
+		case 90:  // Авария системы
+				Stop_all_PCH();
+				if (S2) {
+					if ((!MainError) && (!AdditError)) {
+						StateOfSystem = 10;
+						break;
+					} else if ((!MainError) && (!ReservError)) {
+						nAddit = nReserv;
+						nReserv = 6 - nMain - nAddit;
+						StateOfSystem = 10;
+						break;
+					} else if ((!AdditError) && (!ReservError)) {
+						nMain = nAddit;
+						nAddit = nReserv;
+						nReserv = 6 - nMain - nAddit;
+						StateOfSystem = 10;
+						break;
+					}
+				}					
+				break;
+		} 
+//		else Stop_PCH(nMain);
+		SetWord(@StateOfSysteme@,0,StateOfSystem);
+
+/*// Формируем сообщение об аварийном останове по срабатыванию дискрета DI1
+		if (S1) SetBit(@EmergencyStop@,0,1);
+		else SetBit(@EmergencyStop@,0,0); */
+// Режим день/ночь
+		
+		if (GetBit(@enDayNightMode@,0)) { //при активации режима день/ночь
+			CurrentSetPress = GetWord(@CurrentSetPress@, 0);  //уставка давления, полученная с HMI
+			SetPressDay=GetWord(@SetPressDay@, 0); //уставка давления дня
+			SetPressNight=GetWord(@SetPressNight@, 0); //уставка давления ночи
+			CurrentTime=GetWord(@Hour@, 0)*60 + GetWord(@Minute@, 0); //переводим текущее время в кол-во минут после полуночи
+			DayModeTimeWD=GetWord(@HourDayWD@, 0)*60 + GetWord(@MinuteDayWD@, 0); //количество минут после полуночи - начало дня (будни)
+			NightModeTimeWD=GetWord(@HourNightWD@, 0)*60 + GetWord(@MinuteNightWD@, 0); //количество минут после полуночи - начало ночи (будни)
+			DayModeTimeWE=GetWord(@HourDayWE@, 0)*60 + GetWord(@MinuteDayWE@, 0); //количество минут после полуночи - начало дня (выходные)
+			NightModeTimeWE=GetWord(@HourNightWE@, 0)*60 + GetWord(@MinuteNightWE@, 0); //количество минут после полуночи - начало ночи (выходные)
+			Day=GetWord(@Day@,0);
+			if (Day < 6) { //будни
+				if (DayModeTimeWD < NightModeTimeWD) { // день начинается раньше ночи, ночь до полуночи (напр. день с 7:30, ночь с 22:30)
+					if ((CurrentTime >= DayModeTimeWD) && (CurrentTime < NightModeTimeWD)) { //текущее время более времени начала дня, но меньше начала ночи
+						SetPressDay(); //если оператор изменил уставку давления в главном окне
+					}
+					else if (CurrentTime >= NightModeTimeWD || CurrentTime < DayModeTimeWD) { //текущее время после начала ночи, но до времени дня
+						SetPressNight(); //если оператор изменил уставку давления в главном окне
+					}
+				} else if (DayModeTimeWD > NightModeTimeWD) { //день начинается позже ночи, ночь после полуночи (напр. день с 6:00, ночь с 01:30)
+					if ((CurrentTime >= NightModeTimeWD) && (CurrentTime < DayModeTimeWD))  { //текущее время после времени начала ночи (>=1:30)
+						SetPressNight(); //если оператор изменил уставку давления в главном окне
+					}
+					else if (CurrentTime >= DayModeTimeWD || CurrentTime < NightModeTimeWD) { //текущее время после начала дня (>=6:00 или <1:30)
+						SetPressDay(); //если оператор изменил уставку давления в главном окне
+					}
+				} else {
+					CurrentSetPress=SetPressDay;
+				}
+			} 
+			if (Day > 5) { //выходные дни
+				if (DayModeTimeWE < NightModeTimeWE) { // день начинается раньше ночи, ночь до полуночи (напр. день с 7:30, ночь с 22:30)
+					if ((CurrentTime >= DayModeTimeWE) && (CurrentTime < NightModeTimeWE)) { //текущее время более времени начала дня, но меньше начала ночи
+						SetPressDay(); //если оператор изменил уставку давления в главном окне
+					}
+					else if (CurrentTime >= NightModeTimeWE || CurrentTime < DayModeTimeWE) { //текущее время после начала ночи, но до времени дня
+						SetPressNight(); //если оператор изменил уставку давления в главном окне
+					}
+				} else if (DayModeTimeWE > NightModeTimeWE) { //день начинается позже ночи, ночь после полуночи (напр. день с 6:00, ночь с 01:30)
+					if ((CurrentTime >= NightModeTimeWE) && (CurrentTime < DayModeTimeWE))  { //текущее время после времени начала ночи (>=1:30)
+						SetPressNight(); //если оператор изменил уставку давления в главном окне
+					}
+					else if (CurrentTime >= DayModeTimeWE || CurrentTime < NightModeTimeWE) { //текущее время после начала дня (>=6:00 или <1:30)
+						SetPressDay(); //если оператор изменил уставку давления в главном окне
+					}
+				} else {
+					CurrentSetPress=SetPressDay;
+				}
+			} //выходные дни
+			SetWord(@SetPressDay@,0,SetPressDay);
+			SetWord(@SetPressNight@,0,SetPressNight);
+			SetWord(@CurrentSetPress@,0,CurrentSetPress); 	
+		} 
+		else { //если функция "день/ночь" не активна
+			SetPressDay(); //если оператор изменил уставку давления в главном окне 
+	}
+///////////////////////////////////////////Настройки ПЧ1
+// Окно - Основные настройки ПЧ1
+		if (CurrentWindow==DataPCH1) {
+			// Считываем значения из ПЧ 
+			if (CurrentProgWindow != DataPCH1) {
+				CurrentProgWindow =  DataPCH1;
+				read_memory_PCH(1,0,1,2);
+				read_memory_PCH(1,0,6,2);
+				read_memory_PCH(1,0,13,1);
+				read_memory_PCH(1,1,8,1);
+				read_memory_PCH(1,5,0,6);
+				read_memory_PCH(1,6,3,2);
+				read_memory_PCH(1,7,13,1);
+			}
+			if (GetBit(@SetDefault@, 0)) { //если нажата кнопка записать параметры по умолчанию
+				SetBit(@SetDefault@, 0, 0);
+				// записываем в ПЧ
+				if (read_HMI_P(1,0,0) != 2) write_PCH(1,0,0,2); // режим управления скоростью
+				if (read_HMI_P(1,0,1) != 1) write_PCH(1,0,1,1); // источник команды пуска
+				if (read_HMI_P(1,0,6) != 0) write_PCH(1,0,6,0); // источник задания частоты A (панель)
+				if (read_HMI_P(1,0,7) != 8) write_PCH(1,0,7,8); // источник задания частоты В (Modbus)
+				if (read_HMI_P(1,0,13) != 0) write_PCH(1,0,13,0); // направление вращения
+				if (read_HMI_P(1,1,8) != 1) write_PCH(1,1,8,1); // режим останова 
+				if (read_HMI_P(1,5,0) != 1) write_PCH(1,5,0,1);               		    	 // определяем HDI как цифровой вход
+				if (read_HMI_P(1,5,1) != 1) write_PCH(1,5,1,1);               		    	 // S1 - Пуск
+		//		if (read_HMI_P(1,5,2) != 38) write_PCH(1,5,2,38);               		     // S2 - Автоматический режим (при отсутствии - ручной), функция ПЧ: 38 - управление по Modbus
+				if (read_HMI_P(1,5,3) != 13) write_PCH(1,5,3,13);               		     // S3 - перемычка с S2 (переход на канал задания частоты B)  функция ПЧ: 38 
+				if (read_HMI_P(1,5,4) != 9) write_PCH(1,5,4,9);               		    	 // S4 - Сухой ход, функция ПЧ: 9 - внешняя неисправность
+				if (read_HMI_P(1,5,5) != 0) write_PCH(1,5,5,0);               		    	 // HDI - Пожар, функция ПЧ: 0
+				if (read_HMI_P(1,6,3) != 5) write_PCH(1,6,3,5);               		    	 // R01 - авария ПЧ
+				if (read_HMI_P(1,6,4) != 1) write_PCH(1,6,4,1);               		    	 // R02 - работа ПЧ
+			}
+		}
+// Окно - Базовые параметры ПЧ1
+		if (CurrentWindow==BasicParamPCH1) {
+			// Считываем значения из ПЧ 
+			if (CurrentProgWindow != BasicParamPCH1) {
+				CurrentProgWindow =  BasicParamPCH1;
+				read_memory_PCH(1,0,3,3);
+				read_memory_PCH(1,0,11,2);
+				read_memory_PCH(1,14,4,2);
+			}
+			if (GetBit(@SetDefault@, 0)) { //если нажата кнопка записать параметры по умолчанию
+				SetBit(@SetDefault@, 0, 0);
+				// записываем в ПЧ по умолчанию
+				if (read_HMI_P(1,14,4) != 0) write_PCH(1,14,4,0); // время ожидания связи
+				if (read_HMI_P(1,14,5) != 0) write_PCH(1,14,5,0); // источник команды пуска
+			}
+			if (GetBit(@SetParamsPCH@, 0)) { //если нажата кнопка записать параметры по умолчанию
+				SetBit(@SetParamsPCH@, 0, 0);
+				// записываем в ПЧ из панели
+				write_PCH(1,14,4,read_HMI_P(1,14,4));
+				write_PCH(1,14,5,read_HMI_P(1,14,5));
+			}
+		}	
+// Окно - Настройки двигателя ПЧ1
+		if (CurrentWindow==DriveParamPCH1) {
+			// Считываем значения из ПЧ 
+			if (CurrentProgWindow != DriveParamPCH1) {
+				CurrentProgWindow =  DriveParamPCH1;
+				read_memory_PCH(1,2,1,5);
+			}
+			if (GetBit(@SetParamsPCH@, 0)) { //если нажата кнопка записать параметры по умолчанию
+				SetBit(@SetParamsPCH@, 0, 0);
+				// записываем в ПЧ из панели
+				write_PCH(1,2,1,read_HMI_P(1,2,1));
+				write_PCH(1,2,2,read_HMI_P(1,2,2));
+				write_PCH(1,2,3,read_HMI_P(1,2,3));
+				write_PCH(1,2,4,read_HMI_P(1,2,4));
+				write_PCH(1,2,5,read_HMI_P(1,2,5));
+			}
+		}
+// Окно - Электрические защиты ПЧ1
+		if (CurrentWindow==ProtectElectrPCH1) {
+		// Считываем значения из ПЧ 
+			if (CurrentProgWindow != ProtectElectrPCH1) {
+				CurrentProgWindow =  ProtectElectrPCH1;
+				read_memory_PCH(1,11,1,1);
+				read_memory_PCH(1,11,5,8);
+			}
+			if (GetBit(@SetDefault@, 0)) { //если нажата кнопка записать параметры по умолчанию
+				SetBit(@SetDefault@, 0, 0);
+				// записываем в ПЧ
+				write_PCH(1,11,1,0); // активация снижение частоты при перерыве питания
+				write_PCH(1,11,5,1); // активация ограничения по току
+				write_PCH(1,11,6,1200); // порог тока для ограничения
+				write_PCH(1,11,7,1000); // снижение частоты при ограничении
+				write_PCH(1,11,8,0); // активация защит по перегрузке и сухому ходу
+				write_PCH(1,11,10,10); // время обнаружения перегрузки
+				write_PCH(1,11,11,50); // порог тока при сухом ходе
+				write_PCH(1,11,12,10); // время обнаружения сухого хода
+			}
+			if (GetBit(@SetParamsPCH@, 0)) { //если нажата кнопка применить
+				SetBit(@SetParamsPCH@, 0, 0);
+				// записываем в ПЧ из панели
+				write_PCH(1,11,1,read_HMI_P(1,11,1)); // активация снижение частоты при перерыве питания
+				write_PCH(1,11,5,read_HMI_P(1,11,5)); // активация ограничения по току
+				write_PCH(1,11,6,read_HMI_P(1,11,6)); // порог тока для ограничения
+				write_PCH(1,11,7,read_HMI_P(1,11,7)); // снижение частоты при ограничении
+				write_PCH(1,11,8,read_HMI_P(1,11,8)); // активация защит по перегрузке и сухому ходу
+				write_PCH(1,11,9,read_HMI_P(1,11,9)); // порог тока перегрузки
+				write_PCH(1,11,10,read_HMI_P(1,11,10)); // время обнаружения перегрузки
+				write_PCH(1,11,11,read_HMI_P(1,11,11)); // порог тока при сухом ходе
+				write_PCH(1,11,12,read_HMI_P(1,11,12)); // время обнаружения сухого хода
+			}
+		}
+// Окно - Статус ПЧ1
+		if (CurrentWindow==StatusPCH1) {
+		// Считываем значения из ПЧ 
+			if (CurrentProgWindow != StatusPCH1) {
+				CurrentProgWindow =  StatusPCH1;
+				read_memory_PCH(1,7,27,11);
+				read_memory_PCH(1,7,41,5);
+				read_memory_PCH(1,7,49,5);
+			}
+		}		
+///////////////////////// ПЧ2
+// Окно - Основные настройки ПЧ2
+		if (CurrentWindow==DataPCH2) {
+			// Считываем значения из ПЧ 
+			if (CurrentProgWindow != DataPCH2) {
+				CurrentProgWindow =  DataPCH2;
+				read_memory_PCH(2,0,1,2);
+				read_memory_PCH(2,0,6,2);
+				read_memory_PCH(2,0,13,1);
+				read_memory_PCH(2,1,8,1);
+				read_memory_PCH(2,5,0,6);
+				read_memory_PCH(2,6,3,2);
+				read_memory_PCH(2,7,13,1);
+			}
+			if (GetBit(@SetDefault@, 0)) { //если нажата кнопка записать параметры по умолчанию
+				SetBit(@SetDefault@, 0, 0);
+				// записываем в ПЧ
+				if (read_HMI_P(2,0,0) != 2) write_PCH(2,0,0,2); // режим управления скоростью
+				if (read_HMI_P(2,0,1) != 1) write_PCH(2,0,1,1); // источник команды пуска
+				if (read_HMI_P(2,0,6) != 0) write_PCH(2,0,6,0); // источник задания частоты A (панель)
+				if (read_HMI_P(2,0,7) != 8) write_PCH(2,0,7,8); // источник задания частоты В (Modbus)
+				if (read_HMI_P(2,0,13) != 0) write_PCH(2,0,13,0); // направление вращения
+				if (read_HMI_P(2,1,8) != 1) write_PCH(2,1,8,1); // режим останова 
+				if (read_HMI_P(2,5,0) != 1) write_PCH(2,5,0,1);               		    	 // определяем HDI как цифровой вход
+				if (read_HMI_P(2,5,1) != 1) write_PCH(2,5,1,1);               		    	 // S1 - Пуск
+		//		if (read_HMI_P(2,5,2) != 38) write_PCH(2,5,2,38);               		     // S2 - Автоматический режим (при отсутствии - ручной), функция ПЧ: 38 - управление по Modbus
+				if (read_HMI_P(2,5,3) != 13) write_PCH(2,5,3,13);               		     // S3 - перемычка с S2 (переход на канал задания частоты B)  функция ПЧ: 38 
+				if (read_HMI_P(2,5,4) != 9) write_PCH(2,5,4,9);               		    	 // S4 - Сухой ход, функция ПЧ: 9 - внешняя неисправность
+				if (read_HMI_P(2,5,5) != 0) write_PCH(2,5,5,0);               		    	 // HDI - Пожар, функция ПЧ: 0
+				if (read_HMI_P(2,6,3) != 5) write_PCH(2,6,3,5);               		    	 // R01 - авария ПЧ
+				if (read_HMI_P(2,6,4) != 1) write_PCH(2,6,4,1);               		    	 // R02 - работа ПЧ
+			}
+		}
+// Окно - Базовые параметры ПЧ2
+		if (CurrentWindow==BasicParamPCH2) {
+			// Считываем значения из ПЧ 
+			if (CurrentProgWindow != BasicParamPCH2) {
+				CurrentProgWindow =  BasicParamPCH2;
+				read_memory_PCH(2,0,3,3);
+				read_memory_PCH(2,0,11,2);
+				read_memory_PCH(2,14,4,2);
+			}
+			if (GetBit(@SetDefault@, 0)) { //если нажата кнопка записать параметры по умолчанию
+				SetBit(@SetDefault@, 0, 0);
+				// записываем в ПЧ по умолчанию
+				if (read_HMI_P(2,14,4) != 0) write_PCH(2,14,4,0); // время ожидания связи
+				if (read_HMI_P(2,14,5) != 0) write_PCH(2,14,5,0); // источник команды пуска
+			}
+			if (GetBit(@SetParamsPCH@, 0)) { //если нажата кнопка записать параметры по умолчанию
+				SetBit(@SetParamsPCH@, 0, 0);
+				// записываем в ПЧ из панели
+				write_PCH(2,14,4,read_HMI_P(2,14,4));
+				write_PCH(2,14,5,read_HMI_P(2,14,5));
+			}
+		}	
+// Окно - Настройки двигателя ПЧ2
+		if (CurrentWindow==DriveParamPCH2) {
+			// Считываем значения из ПЧ 
+			if (CurrentProgWindow != DriveParamPCH2) {
+				CurrentProgWindow =  DriveParamPCH2;
+				read_memory_PCH(2,2,1,5);
+			}
+			if (GetBit(@SetParamsPCH@, 0)) { //если нажата кнопка записать параметры по умолчанию
+				SetBit(@SetParamsPCH@, 0, 0);
+				// записываем в ПЧ из панели
+				write_PCH(2,2,1,read_HMI_P(2,2,1));
+				write_PCH(2,2,2,read_HMI_P(2,2,2));
+				write_PCH(2,2,3,read_HMI_P(2,2,3));
+				write_PCH(2,2,4,read_HMI_P(2,2,4));
+				write_PCH(2,2,5,read_HMI_P(2,2,5));
+			}
+		}
+// Окно - Электрические защиты ПЧ2
+		if (CurrentWindow==ProtectElectrPCH2) {
+		// Считываем значения из ПЧ 
+			if (CurrentProgWindow != ProtectElectrPCH2) {
+				CurrentProgWindow =  ProtectElectrPCH2;
+				read_memory_PCH(2,11,1,1);
+				read_memory_PCH(2,11,5,8);
+			}
+			if (GetBit(@SetDefault@, 0)) { //если нажата кнопка записать параметры по умолчанию
+				SetBit(@SetDefault@, 0, 0);
+				// записываем в ПЧ
+				write_PCH(2,11,1,0); // активация снижение частоты при перерыве питания
+				write_PCH(2,11,5,1); // активация ограничения по току
+				write_PCH(2,11,6,1200); // порог тока для ограничения
+				write_PCH(2,11,7,1000); // снижение частоты при ограничении
+				write_PCH(2,11,8,0); // активация защит по перегрузке и сухому ходу
+				write_PCH(2,11,10,10); // время обнаружения перегрузки
+				write_PCH(2,11,11,50); // порог тока при сухом ходе
+				write_PCH(2,11,12,10); // время обнаружения сухого хода
+			}
+			if (GetBit(@SetParamsPCH@, 0)) { //если нажата кнопка применить
+				SetBit(@SetParamsPCH@, 0, 0);
+				// записываем в ПЧ из панели
+				write_PCH(2,11,1,read_HMI_P(2,11,1)); // активация снижение частоты при перерыве питания
+				write_PCH(2,11,5,read_HMI_P(2,11,5)); // активация ограничения по току
+				write_PCH(2,11,6,read_HMI_P(2,11,6)); // порог тока для ограничения
+				write_PCH(2,11,7,read_HMI_P(2,11,7)); // снижение частоты при ограничении
+				write_PCH(2,11,8,read_HMI_P(2,11,8)); // активация защит по перегрузке и сухому ходу
+				write_PCH(2,11,9,read_HMI_P(2,11,9)); // порог тока перегрузки
+				write_PCH(2,11,10,read_HMI_P(2,11,10)); // время обнаружения перегрузки
+				write_PCH(2,11,11,read_HMI_P(2,11,11)); // порог тока при сухом ходе
+				write_PCH(2,11,12,read_HMI_P(2,11,12)); // время обнаружения сухого хода
+			}
+		}
+// Окно - Статус ПЧ2
+		if (CurrentWindow==StatusPCH2) {
+		// Считываем значения из ПЧ 
+			if (CurrentProgWindow != StatusPCH2) {
+				CurrentProgWindow =  StatusPCH2;
+				read_memory_PCH(2,7,27,11);
+				read_memory_PCH(2,7,41,5);
+				read_memory_PCH(2,7,49,5);
+			}
+		}			
+///////////////////////// ПЧ3
+// Окно - Основные настройки ПЧ3
+		if (CurrentWindow==DataPCH3) {
+			// Считываем значения из ПЧ 
+			if (CurrentProgWindow != DataPCH3) {
+				CurrentProgWindow =  DataPCH3;
+				read_memory_PCH(3,0,1,2);
+				read_memory_PCH(3,0,6,2);
+				read_memory_PCH(3,0,13,1);
+				read_memory_PCH(3,1,8,1);
+				read_memory_PCH(3,5,0,6);
+				read_memory_PCH(3,6,3,2);
+				read_memory_PCH(3,7,13,1);
+			}
+			if (GetBit(@SetDefault@, 0)) { //если нажата кнопка записать параметры по умолчанию
+				SetBit(@SetDefault@, 0, 0);
+				// записываем в ПЧ
+				if (read_HMI_P(3,0,0) != 2) write_PCH(3,0,0,2); // режим управления скоростью
+				if (read_HMI_P(3,0,1) != 1) write_PCH(3,0,1,1); // источник команды пуска
+				if (read_HMI_P(3,0,6) != 0) write_PCH(3,0,6,0); // источник задания частоты A (панель)
+				if (read_HMI_P(3,0,7) != 8) write_PCH(3,0,7,8); // источник задания частоты В (Modbus)
+				if (read_HMI_P(3,0,13) != 0) write_PCH(3,0,13,0); // направление вращения
+				if (read_HMI_P(3,1,8) != 1) write_PCH(3,1,8,1); // режим останова 
+				if (read_HMI_P(3,5,0) != 1) write_PCH(3,5,0,1);               		    	 // определяем HDI как цифровой вход
+				if (read_HMI_P(3,5,1) != 1) write_PCH(3,5,1,1);               		    	 // S1 - Пуск
+		//		if (read_HMI_P(3,5,2) != 38) write_PCH(3,5,2,38);               		     // S2 - Автоматический режим (при отсутствии - ручной), функция ПЧ: 38 - управление по Modbus
+				if (read_HMI_P(3,5,3) != 13) write_PCH(3,5,3,13);               		     // S3 - перемычка с S2 (переход на канал задания частоты B)  функция ПЧ: 38 
+				if (read_HMI_P(3,5,4) != 9) write_PCH(3,5,4,9);               		    	 // S4 - Сухой ход, функция ПЧ: 9 - внешняя неисправность
+				if (read_HMI_P(3,5,5) != 0) write_PCH(3,5,5,0);               		    	 // HDI - Пожар, функция ПЧ: 0
+				if (read_HMI_P(3,6,3) != 5) write_PCH(3,6,3,5);               		    	 // R01 - авария ПЧ
+				if (read_HMI_P(3,6,4) != 1) write_PCH(3,6,4,1);               		    	 // R02 - работа ПЧ
+			}
+		}
+// Окно - Базовые параметры ПЧ3
+		if (CurrentWindow==BasicParamPCH3) {
+			// Считываем значения из ПЧ 
+			if (CurrentProgWindow != BasicParamPCH3) {
+				CurrentProgWindow =  BasicParamPCH3;
+				read_memory_PCH(3,0,3,3);
+				read_memory_PCH(3,0,11,2);
+				read_memory_PCH(3,14,4,2);
+			}
+			if (GetBit(@SetDefault@, 0)) { //если нажата кнопка записать параметры по умолчанию
+				SetBit(@SetDefault@, 0, 0);
+				// записываем в ПЧ по умолчанию
+				if (read_HMI_P(3,14,4) != 0) write_PCH(3,14,4,0); // время ожидания связи
+				if (read_HMI_P(3,14,5) != 0) write_PCH(3,14,5,0); // источник команды пуска
+			}
+			if (GetBit(@SetParamsPCH@, 0)) { //если нажата кнопка записать параметры по умолчанию
+				SetBit(@SetParamsPCH@, 0, 0);
+				// записываем в ПЧ из панели
+				write_PCH(3,14,4,read_HMI_P(3,14,4));
+				write_PCH(3,14,5,read_HMI_P(3,14,5));
+			}
+		}	
+// Окно - Настройки двигателя ПЧ3
+		if (CurrentWindow==DriveParamPCH3) {
+			// Считываем значения из ПЧ 
+			if (CurrentProgWindow != DriveParamPCH3) {
+				CurrentProgWindow =  DriveParamPCH3;
+				read_memory_PCH(3,2,1,5);
+			}
+			if (GetBit(@SetParamsPCH@, 0)) { //если нажата кнопка записать параметры по умолчанию
+				SetBit(@SetParamsPCH@, 0, 0);
+				// записываем в ПЧ из панели
+				write_PCH(3,2,1,read_HMI_P(3,2,1));
+				write_PCH(3,2,2,read_HMI_P(3,2,2));
+				write_PCH(3,2,3,read_HMI_P(3,2,3));
+				write_PCH(3,2,4,read_HMI_P(3,2,4));
+				write_PCH(3,2,5,read_HMI_P(3,2,5));
+			}
+		}
+// Окно - Электрические защиты ПЧ3
+		if (CurrentWindow==ProtectElectrPCH3) {
+		// Считываем значения из ПЧ 
+			if (CurrentProgWindow != ProtectElectrPCH3) {
+				CurrentProgWindow =  ProtectElectrPCH3;
+				read_memory_PCH(3,11,1,1);
+				read_memory_PCH(3,11,5,8);
+			}
+			if (GetBit(@SetDefault@, 0)) { //если нажата кнопка записать параметры по умолчанию
+				SetBit(@SetDefault@, 0, 0);
+				// записываем в ПЧ
+				write_PCH(3,11,1,0); // активация снижение частоты при перерыве питания
+				write_PCH(3,11,5,1); // активация ограничения по току
+				write_PCH(3,11,6,1200); // порог тока для ограничения
+				write_PCH(3,11,7,1000); // снижение частоты при ограничении
+				write_PCH(3,11,8,0); // активация защит по перегрузке и сухому ходу
+				write_PCH(3,11,10,10); // время обнаружения перегрузки
+				write_PCH(3,11,11,50); // порог тока при сухом ходе
+				write_PCH(3,11,12,10); // время обнаружения сухого хода
+			}
+			if (GetBit(@SetParamsPCH@, 0)) { //если нажата кнопка применить
+				SetBit(@SetParamsPCH@, 0, 0);
+				// записываем в ПЧ из панели
+				write_PCH(3,11,1,read_HMI_P(3,11,1)); // активация снижение частоты при перерыве питания
+				write_PCH(3,11,5,read_HMI_P(3,11,5)); // активация ограничения по току
+				write_PCH(3,11,6,read_HMI_P(3,11,6)); // порог тока для ограничения
+				write_PCH(3,11,7,read_HMI_P(3,11,7)); // снижение частоты при ограничении
+				write_PCH(3,11,8,read_HMI_P(3,11,8)); // активация защит по перегрузке и сухому ходу
+				write_PCH(3,11,9,read_HMI_P(3,11,9)); // порог тока перегрузки
+				write_PCH(3,11,10,read_HMI_P(3,11,10)); // время обнаружения перегрузки
+				write_PCH(3,11,11,read_HMI_P(3,11,11)); // порог тока при сухом ходе
+				write_PCH(3,11,12,read_HMI_P(3,11,12)); // время обнаружения сухого хода
+			}
+		}
+// Окно - Статус ПЧ3
+		if (CurrentWindow==StatusPCH3) {
+		// Считываем значения из ПЧ 
+			if (CurrentProgWindow != StatusPCH3) {
+				CurrentProgWindow =  StatusPCH3;
+				read_memory_PCH(3,7,27,11);
+				read_memory_PCH(3,7,41,5);
+				read_memory_PCH(3,7,49,5);
+			}
+		}		
+		
+// Вычисление времени выполнения цикла 
+		EndMcTime = GetWord(@Seconds@, 0)*1000+GetWord(@mSeconds@, 0);
+		if (EndMcTime>StartMcTime) {
+			McTime=EndMcTime-StartMcTime;
+			SetWord(@McTime@, 0, (unsigned short)McTime);
+		}
+	} //конец цикла while
+	return 0;
+} // конец программы
